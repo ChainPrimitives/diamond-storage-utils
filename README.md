@@ -54,6 +54,221 @@ npm install ethers
 
 ---
 
+## Getting Started
+
+This section walks you through setting up a brand-new TypeScript project that uses `diamond-storage-utils` — from `npm init` to running a complete storage safety check.
+
+### Step 1 — Create your project
+
+```bash
+mkdir my-diamond-tooling
+cd my-diamond-tooling
+npm init -y
+```
+
+### Step 2 — Install dependencies
+
+```bash
+npm install diamond-storage-utils ethers
+npm install -D typescript tsx @types/node
+```
+
+> **`tsx`** lets you run `.ts` files directly without a build step — great for scripts and tooling. You can replace it with `ts-node` if you prefer.
+
+### Step 3 — Add a TypeScript config
+
+Create `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+### Step 4 — Write your first script
+
+Create `check-storage.ts` and paste the following. It demonstrates the full workflow — compute slots, describe your facets, detect collisions, extract selectors, and build a `diamondCut` call:
+
+```ts
+import {
+  computeStorageSlot,
+  computeStructSlots,
+  detectCollisions,
+  validateNewFacet,
+  formatCollisionReport,
+  getSelectors,
+  detectSelectorCollisions,
+  buildDiamondCut,
+  generateStorageLibrary,
+} from "diamond-storage-utils";
+import type { FacetInfo } from "diamond-storage-utils";
+
+// ─── 1. Compute storage slots ────────────────────────────────────────────────
+//
+// Each facet needs a unique namespace. The slot is keccak256(namespace) - 1.
+// This value goes into your Solidity library as the STORAGE_POSITION constant.
+
+const tokenSlot = computeStorageSlot("my.token.storage");
+const govSlot   = computeStorageSlot("my.governance.storage");
+
+console.log("Token slot:     ", tokenSlot);
+console.log("Governance slot:", govSlot);
+// These are different — no collision possible between the two namespaces.
+
+
+// ─── 2. Inspect struct member slots ─────────────────────────────────────────
+//
+// Each struct member occupies a sequential slot starting from the base.
+// Useful for verifying layout before writing Solidity.
+
+const govStructSlots = computeStructSlots(
+  "my.governance.storage",
+  ["quorum", "votingPeriod", "admin"],
+  ["uint256", "uint256", "address"]
+);
+
+console.log("\nGovernance struct layout:");
+for (const s of govStructSlots) {
+  console.log(`  ${s.name} (${s.type}): ${s.slot}`);
+}
+
+
+// ─── 3. Generate the Solidity library ───────────────────────────────────────
+//
+// Paste this output into your Solidity project as LibGovernanceStorage.sol
+
+const solidityCode = generateStorageLibrary("my.governance", [
+  { name: "quorum",       type: "uint256" },
+  { name: "votingPeriod", type: "uint256" },
+  { name: "admin",        type: "address" },
+]);
+
+console.log("\nGenerated Solidity library:");
+console.log(solidityCode);
+
+
+// ─── 4. Describe your facets ─────────────────────────────────────────────────
+//
+// FacetInfo is the central type in this library. It describes a facet's name,
+// address, which selectors it exposes, and which storage slots it occupies.
+// You typically build these during your deployment or test setup.
+
+const tokenFacet: FacetInfo = {
+  name: "TokenFacet",
+  address: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  selectors: getSelectors([
+    "function transfer(address to, uint256 amount) external returns (bool)",
+    "function balanceOf(address account) external view returns (uint256)",
+  ]),
+  storageSlots: [
+    { name: "totalSupply", slot: tokenSlot, facetName: "TokenFacet", type: "uint256" },
+  ],
+};
+
+const governanceFacet: FacetInfo = {
+  name: "GovernanceFacet",
+  address: "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  selectors: getSelectors([
+    "function propose(address[] targets) external returns (uint256)",
+    "function vote(uint256 proposalId, bool support) external",
+    "function execute(uint256 proposalId) external",
+  ]),
+  storageSlots: [
+    { name: "quorum",       slot: govStructSlots[0]!.slot, facetName: "GovernanceFacet", type: "uint256" },
+    { name: "votingPeriod", slot: govStructSlots[1]!.slot, facetName: "GovernanceFacet", type: "uint256" },
+    { name: "admin",        slot: govStructSlots[2]!.slot, facetName: "GovernanceFacet", type: "address" },
+  ],
+};
+
+
+// ─── 5. Check for storage slot collisions ───────────────────────────────────
+//
+// Run this before every deploy. If two facets share a slot, one will silently
+// overwrite the other's data — no compiler error, no revert.
+
+const collisionReport = detectCollisions([tokenFacet, governanceFacet]);
+console.log("\nCollision check:", formatCollisionReport(collisionReport));
+// → ✅ No storage slot collisions detected.
+
+
+// ─── 6. Validate a new facet before adding it ───────────────────────────────
+//
+// Before adding a facet to an existing Diamond, check it won't collide
+// with any already-registered facets.
+
+const newFacet: FacetInfo = {
+  name: "RewardsFacet",
+  address: "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+  selectors: getSelectors(["function claim() external"]),
+  storageSlots: [
+    {
+      name: "rewardPool",
+      // Safe: different namespace → different slot
+      slot: computeStorageSlot("my.rewards.storage"),
+      facetName: "RewardsFacet",
+      type: "uint256",
+    },
+  ],
+};
+
+const safetyCheck = validateNewFacet([tokenFacet, governanceFacet], newFacet);
+if (safetyCheck.hasCollisions) {
+  console.error("Cannot add RewardsFacet:", formatCollisionReport(safetyCheck));
+  process.exit(1);
+}
+console.log("RewardsFacet is safe to add ✅");
+
+
+// ─── 7. Check for selector collisions ───────────────────────────────────────
+//
+// Two facets cannot expose the same 4-byte selector. The Diamond would route
+// calls to whichever was registered last, silently ignoring the other.
+
+const selectorConflicts = detectSelectorCollisions([
+  { name: tokenFacet.name,      selectors: tokenFacet.selectors },
+  { name: governanceFacet.name, selectors: governanceFacet.selectors },
+  { name: newFacet.name,        selectors: newFacet.selectors },
+]);
+
+if (selectorConflicts.length > 0) {
+  console.error("Selector conflicts found:", selectorConflicts);
+  process.exit(1);
+}
+console.log("No selector conflicts ✅");
+
+
+// ─── 8. Build the diamondCut call ───────────────────────────────────────────
+//
+// Once you're satisfied everything is safe, build the FacetCut structs.
+// Pass these to your Diamond's diamondCut() function.
+
+const cut = buildDiamondCut(newFacet.address, newFacet.selectors, "Add");
+console.log("\nFacetCut struct for diamondCut():", cut);
+// → { facetAddress: "0xCCC...", action: 0, functionSelectors: ["0x4","..."] }
+//
+// Usage in ethers:
+//   await diamond.diamondCut([cut], ethers.ZeroAddress, "0x");
+
+console.log("\n✅ All checks passed. Safe to deploy.");
+```
+
+### Step 5 — Run it
+
+```bash
+npx tsx check-storage.ts
+```
+
+You'll see all the computed slots, the generated Solidity library, and confirmation that no collisions exist.
+
+---
+
 ## Background: How Diamond Storage Works
 
 In a regular Solidity contract, state variables are stored sequentially starting at slot `0`. In a Diamond, all facets share the same proxy storage, so using sequential slots would mean different facets overwrite each other.
